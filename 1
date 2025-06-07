@@ -1,0 +1,1291 @@
+import javax.smartcardio.*;
+import javax.swing.*;
+import javax.swing.border.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.*;
+import javax.crypto.*;
+import javax.crypto.spec.*;
+import java.security.*;
+import java.text.SimpleDateFormat;
+
+
+/**
+ * 电子护照个人化工具
+ * 
+ */
+public class EPassportWriter extends JFrame {
+    
+    // ==================== 常量定义 ====================
+    private static final String APP_TITLE = "电子护照个人化工具 v3.0";
+    private static final byte[] PASSPORT_AID = {
+        (byte)0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01
+    };
+    
+    // 文件标识符
+    private static final byte[] FID_EF_COM = {0x01, 0x1E};
+    private static final byte[] FID_EF_DG1 = {0x01, 0x01};
+    private static final byte[] FID_EF_DG2 = {0x01, 0x02};
+    private static final byte[] FID_EF_SOD = {0x01, 0x1D};
+    
+    // 分段大小配置
+    private static final int SMALL_CHUNK_SIZE = 240;    // 小文件块大小
+    private static final int LARGE_CHUNK_SIZE = 128;    // 大文件块大小（更保守）
+    private static final int CHUNK_DELAY_MS = 50;       // 块之间的延迟（毫秒）
+    
+    // ==================== UI 组件 ====================
+    private JComboBox<CardTerminal> terminalCombo;
+    private JButton btnConnect, btnDisconnect;
+    private JLabel lblStatus;
+    
+    // 文件操作
+    private JButton btnClearDG1, btnClearDG2, btnClearSOD, btnClearAll;
+    private JButton btnWriteDG1, btnWriteDG2, btnWriteSOD;
+    private JButton btnReadDG1, btnReadDG2, btnReadSOD;
+    
+    // MRZ 和 BAC
+    private JTextArea txtMRZ;
+    private JButton btnSetBAC, btnTestBAC;
+    
+    // 个人化
+    private JButton btnQuickPersonalize, btnLockCard;
+    private JProgressBar progressBar;
+    private JLabel lblProgress;
+    
+    // 日志
+    private JTextArea logArea;
+    private JCheckBox chkAutoScroll;
+    
+    // ==================== 状态变量 ====================
+    private CardChannel channel = null;
+    private Card card = null;
+    private boolean isConnected = false;
+    private boolean isLocked = false;
+    
+    // ==================== 构造函数 ====================
+    public EPassportWriter() {
+        super(APP_TITLE);
+        initializeUI();
+        refreshTerminals();
+    }
+    
+    private void initializeUI() {
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLayout(new BorderLayout());
+        
+        // 主分割面板
+        JSplitPane mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
+        mainSplit.setDividerLocation(700);
+        
+        // 左侧：控制面板
+        mainSplit.setLeftComponent(createControlPanel());
+        
+        // 右侧：日志面板
+        mainSplit.setRightComponent(createLogPanel());
+        
+        add(mainSplit, BorderLayout.CENTER);
+        
+        // 状态栏
+        add(createStatusBar(), BorderLayout.SOUTH);
+        
+        // 设置窗口
+        setSize(1200, 800);
+        setLocationRelativeTo(null);
+        updateUIState();
+    }
+    
+    private JPanel createControlPanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        
+        // 顶部：连接控制
+        panel.add(createConnectionPanel(), BorderLayout.NORTH);
+        
+        // 中间：功能标签页
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("文件操作", createFileOperationsPanel());
+        tabs.addTab("快速个人化", createPersonalizationPanel());
+        tabs.addTab("BAC 测试", createBACTestPanel());
+        
+        panel.add(tabs, BorderLayout.CENTER);
+        
+        return panel;
+    }
+    
+    private JPanel createConnectionPanel() {
+        JPanel panel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        panel.setBorder(BorderFactory.createTitledBorder("连接管理"));
+        
+        panel.add(new JLabel("读卡器:"));
+        terminalCombo = new JComboBox<>();
+        terminalCombo.setPreferredSize(new Dimension(300, 25));
+        panel.add(terminalCombo);
+        
+        JButton btnRefresh = new JButton("刷新");
+        btnRefresh.addActionListener(e -> refreshTerminals());
+        panel.add(btnRefresh);
+        
+        btnConnect = new JButton("连接");
+        btnConnect.addActionListener(e -> connectCard());
+        panel.add(btnConnect);
+        
+        btnDisconnect = new JButton("断开");
+        btnDisconnect.addActionListener(e -> disconnectCard());
+        panel.add(btnDisconnect);
+        
+        lblStatus = new JLabel("未连接");
+        lblStatus.setForeground(Color.RED);
+        panel.add(lblStatus);
+        
+        return panel;
+    }
+    
+    private JPanel createFileOperationsPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.insets = new Insets(5, 5, 5, 5);
+        
+        // 标题
+        gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 4;
+        JLabel title = new JLabel("文件操作（支持断点续传）");
+        title.setFont(new Font("Arial", Font.BOLD, 14));
+        panel.add(title, gbc);
+        
+        // 分隔线
+        gbc.gridy = 1;
+        panel.add(new JSeparator(), gbc);
+        
+        // 文件操作表格
+        gbc.gridy = 2; gbc.gridwidth = 1;
+        panel.add(new JLabel("文件"), gbc);
+        gbc.gridx = 1;
+        panel.add(new JLabel("清除"), gbc);
+        gbc.gridx = 2;
+        panel.add(new JLabel("写入"), gbc);
+        gbc.gridx = 3;
+        panel.add(new JLabel("读取"), gbc);
+        
+        // DG1 行
+        gbc.gridx = 0; gbc.gridy = 3;
+        panel.add(new JLabel("DG1:"), gbc);
+        
+        gbc.gridx = 1;
+        btnClearDG1 = new JButton("清除");
+        btnClearDG1.addActionListener(e -> clearFile("DG1", FID_EF_DG1));
+        panel.add(btnClearDG1, gbc);
+        
+        gbc.gridx = 2;
+        btnWriteDG1 = new JButton("写入");
+        btnWriteDG1.addActionListener(e -> writeFileWithDialog("DG1", FID_EF_DG1));
+        panel.add(btnWriteDG1, gbc);
+        
+        gbc.gridx = 3;
+        btnReadDG1 = new JButton("读取");
+        btnReadDG1.addActionListener(e -> readFile("DG1", FID_EF_DG1));
+        panel.add(btnReadDG1, gbc);
+        
+        // DG2 行
+        gbc.gridx = 0; gbc.gridy = 4;
+        panel.add(new JLabel("DG2:"), gbc);
+        
+        gbc.gridx = 1;
+        btnClearDG2 = new JButton("清除");
+        btnClearDG2.addActionListener(e -> clearFile("DG2", FID_EF_DG2));
+        panel.add(btnClearDG2, gbc);
+        
+        gbc.gridx = 2;
+        btnWriteDG2 = new JButton("写入");
+        btnWriteDG2.addActionListener(e -> writeFileWithDialog("DG2", FID_EF_DG2));
+        panel.add(btnWriteDG2, gbc);
+        
+        gbc.gridx = 3;
+        btnReadDG2 = new JButton("读取");
+        btnReadDG2.addActionListener(e -> readFile("DG2", FID_EF_DG2));
+        panel.add(btnReadDG2, gbc);
+        
+        // SOD 行
+        gbc.gridx = 0; gbc.gridy = 5;
+        panel.add(new JLabel("SOD:"), gbc);
+        
+        gbc.gridx = 1;
+        btnClearSOD = new JButton("清除");
+        btnClearSOD.addActionListener(e -> clearFile("SOD", FID_EF_SOD));
+        panel.add(btnClearSOD, gbc);
+        
+        gbc.gridx = 2;
+        btnWriteSOD = new JButton("写入");
+        btnWriteSOD.addActionListener(e -> writeFileWithDialog("SOD", FID_EF_SOD));
+        panel.add(btnWriteSOD, gbc);
+        
+        gbc.gridx = 3;
+        btnReadSOD = new JButton("读取");
+        btnReadSOD.addActionListener(e -> readFile("SOD", FID_EF_SOD));
+        panel.add(btnReadSOD, gbc);
+        
+        // 清除所有按钮
+        gbc.gridx = 0; gbc.gridy = 6; gbc.gridwidth = 4;
+        gbc.insets = new Insets(20, 5, 5, 5);
+        btnClearAll = new JButton("清除所有文件");
+        btnClearAll.setBackground(new Color(255, 152, 0));
+        btnClearAll.addActionListener(e -> clearAllFiles());
+        panel.add(btnClearAll, gbc);
+        
+        // 提示信息
+        gbc.gridy = 7;
+        gbc.insets = new Insets(10, 5, 5, 5);
+        JTextArea tips = new JTextArea(
+            "提示：\n" +
+            "• 大文件会自动分段写入（128字节/段）\n" +
+            "• 写入中断后，先清除再重新写入\n" +
+            "• DG2 建议使用压缩后的图片（<12KB）"
+        );
+        tips.setEditable(false);
+        tips.setBackground(panel.getBackground());
+        tips.setFont(new Font("Arial", Font.PLAIN, 11));
+        panel.add(tips, gbc);
+        
+        return panel;
+    }
+    
+    private JPanel createPersonalizationPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.insets = new Insets(5, 5, 5, 5);
+        
+        // MRZ 输入
+        gbc.gridx = 0; gbc.gridy = 0; gbc.gridwidth = 2;
+        panel.add(new JLabel("MRZ 数据（两行）:"), gbc);
+        
+        gbc.gridy = 1;
+        txtMRZ = new JTextArea(2, 44);
+        txtMRZ.setFont(new Font("Monospaced", Font.PLAIN, 12));
+        txtMRZ.setText("P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<<\n" +
+                      "L898902C36UT07408122F1204159ZE184226B<<<<<10");
+        JScrollPane mrzScroll = new JScrollPane(txtMRZ);
+        mrzScroll.setPreferredSize(new Dimension(500, 60));
+        panel.add(mrzScroll, gbc);
+        
+        // BAC 设置
+        gbc.gridy = 2;
+        btnSetBAC = new JButton("设置 BAC 密钥");
+        btnSetBAC.addActionListener(e -> setBACKeys());
+        panel.add(btnSetBAC, gbc);
+        
+        // 分隔线
+        gbc.gridy = 3;
+        panel.add(new JSeparator(), gbc);
+        
+        // 快速个人化
+        gbc.gridy = 4;
+        JLabel quickTitle = new JLabel("快速个人化（一键完成）");
+        quickTitle.setFont(new Font("Arial", Font.BOLD, 14));
+        panel.add(quickTitle, gbc);
+        
+        gbc.gridy = 5;
+        btnQuickPersonalize = new JButton("开始个人化");
+        btnQuickPersonalize.setBackground(new Color(76, 175, 80));
+        btnQuickPersonalize.setForeground(Color.WHITE);
+        btnQuickPersonalize.setFont(new Font("Arial", Font.BOLD, 16));
+        btnQuickPersonalize.setPreferredSize(new Dimension(200, 50));
+        btnQuickPersonalize.addActionListener(e -> quickPersonalize());
+        panel.add(btnQuickPersonalize, gbc);
+        
+        // 进度条
+        gbc.gridy = 6;
+        progressBar = new JProgressBar(0, 100);
+        progressBar.setStringPainted(true);
+        progressBar.setPreferredSize(new Dimension(500, 25));
+        panel.add(progressBar, gbc);
+        
+        gbc.gridy = 7;
+        lblProgress = new JLabel(" ");
+        lblProgress.setHorizontalAlignment(JLabel.CENTER);
+        panel.add(lblProgress, gbc);
+        
+        // 锁定按钮
+        gbc.gridy = 8;
+        gbc.insets = new Insets(20, 5, 5, 5);
+        btnLockCard = new JButton("锁定卡片（不可逆）");
+        btnLockCard.setBackground(Color.RED);
+        btnLockCard.setForeground(Color.WHITE);
+        btnLockCard.addActionListener(e -> lockCard());
+        panel.add(btnLockCard, gbc);
+        
+        return panel;
+    }
+    
+    private JPanel createBACTestPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.insets = new Insets(5, 5, 5, 5);
+        
+        gbc.gridx = 0; gbc.gridy = 0;
+        panel.add(new JLabel("BAC 认证测试"), gbc);
+        
+        gbc.gridy = 1;
+        btnTestBAC = new JButton("执行 BAC 认证");
+        btnTestBAC.addActionListener(e -> testBAC());
+        panel.add(btnTestBAC, gbc);
+        
+        return panel;
+    }
+    
+    private JPanel createLogPanel() {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBorder(BorderFactory.createTitledBorder("通信日志"));
+        
+        logArea = new JTextArea();
+        logArea.setFont(new Font("Monospaced", Font.PLAIN, 11));
+        logArea.setEditable(false);
+        JScrollPane scrollPane = new JScrollPane(logArea);
+        panel.add(scrollPane, BorderLayout.CENTER);
+        
+        JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        chkAutoScroll = new JCheckBox("自动滚动", true);
+        controlPanel.add(chkAutoScroll);
+        
+        JButton btnClear = new JButton("清空");
+        btnClear.addActionListener(e -> logArea.setText(""));
+        controlPanel.add(btnClear);
+        
+        panel.add(controlPanel, BorderLayout.SOUTH);
+        
+        return panel;
+    }
+    
+    private JPanel createStatusBar() {
+        JPanel statusBar = new JPanel(new BorderLayout());
+        statusBar.setBorder(BorderFactory.createEtchedBorder());
+        
+        JLabel statusLabel = new JLabel(" 就绪");
+        statusBar.add(statusLabel, BorderLayout.CENTER);
+        
+        return statusBar;
+    }
+    
+    // ==================== 核心功能实现 ====================
+    
+    /**
+     * 刷新读卡器列表
+     */
+    private void refreshTerminals() {
+        try {
+            terminalCombo.removeAllItems();
+            TerminalFactory factory = TerminalFactory.getDefault();
+            List<CardTerminal> terminals = factory.terminals().list();
+            
+            for (CardTerminal terminal : terminals) {
+                terminalCombo.addItem(terminal);
+            }
+            
+            if (terminals.isEmpty()) {
+                log("未发现读卡器");
+            } else {
+                log("发现 " + terminals.size() + " 个读卡器");
+            }
+        } catch (Exception e) {
+            logError("刷新读卡器失败", e);
+        }
+    }
+    
+    /**
+     * 连接卡片
+     */
+    private void connectCard() {
+        try {
+            CardTerminal terminal = (CardTerminal) terminalCombo.getSelectedItem();
+            if (terminal == null) {
+                JOptionPane.showMessageDialog(this, "请选择读卡器");
+                return;
+            }
+            
+            if (!terminal.isCardPresent()) {
+                JOptionPane.showMessageDialog(this, "未检测到卡片");
+                return;
+            }
+            
+            card = terminal.connect("*");
+            channel = card.getBasicChannel();
+            
+            // 选择护照应用
+            CommandAPDU selectApp = new CommandAPDU(0x00, 0xA4, 0x04, 0x00, PASSPORT_AID);
+            ResponseAPDU response = transmit(selectApp);
+            
+            if (response.getSW() == 0x9000) {
+                isConnected = true;
+                lblStatus.setText("已连接");
+                lblStatus.setForeground(Color.GREEN);
+                log("✓ 连接成功，护照应用已选择");
+                updateUIState();
+            } else {
+                throw new Exception("选择护照应用失败: " + String.format("%04X", response.getSW()));
+            }
+            
+        } catch (Exception e) {
+            logError("连接失败", e);
+            disconnectCard();
+        }
+    }
+    
+    /**
+     * 断开连接
+     */
+    private void disconnectCard() {
+        try {
+            if (card != null) {
+                card.disconnect(false);
+                card = null;
+                channel = null;
+            }
+            isConnected = false;
+            lblStatus.setText("未连接");
+            lblStatus.setForeground(Color.RED);
+            log("已断开连接");
+            updateUIState();
+        } catch (Exception e) {
+            logError("断开失败", e);
+        }
+    }
+    
+    /**
+     * 清除文件
+     */
+    private void clearFile(String name, byte[] fid) {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                log("\n=== 清除 " + name + " ===");
+                
+                // 选择文件
+                CommandAPDU selectFile = new CommandAPDU(0x00, 0xA4, 0x02, 0x0C, fid);
+                ResponseAPDU response = transmit(selectFile);
+                
+                if (response.getSW() != 0x9000) {
+                    log("✗ 选择文件失败: " + String.format("%04X", response.getSW()));
+                    return false;
+                }
+                
+                // 写入空数据（覆盖）
+                byte[] emptyData = new byte[240];
+                Arrays.fill(emptyData, (byte)0x00);
+                
+                CommandAPDU updateCmd = new CommandAPDU(0x00, 0xD6, 0x00, 0x00, emptyData);
+                response = transmit(updateCmd);
+                
+                if (response.getSW() == 0x9000) {
+                    log("✓ " + name + " 已清除");
+                    return true;
+                } else {
+                    log("✗ 清除失败: " + String.format("%04X", response.getSW()));
+                    return false;
+                }
+            }
+            
+            @Override
+            protected void done() {
+                try {
+                    if (get()) {
+                        JOptionPane.showMessageDialog(EPassportWriter.this, 
+                            name + " 已清除", "成功", JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } catch (Exception e) {
+                    logError("清除失败", e);
+                }
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * 清除所有文件
+     */
+    private void clearAllFiles() {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        int result = JOptionPane.showConfirmDialog(this, 
+            "确定要清除所有文件吗？", "确认", JOptionPane.YES_NO_OPTION);
+        
+        if (result == JOptionPane.YES_OPTION) {
+            SwingWorker<Void, Void> worker = new SwingWorker<Void, Void>() {
+                @Override
+                protected Void doInBackground() throws Exception {
+                    clearFile("DG1", FID_EF_DG1);
+                    Thread.sleep(100);
+                    clearFile("DG2", FID_EF_DG2);
+                    Thread.sleep(100);
+                    clearFile("SOD", FID_EF_SOD);
+                    return null;
+                }
+            };
+            worker.execute();
+        }
+    }
+    
+    /**
+     * 写入文件（带对话框）
+     */
+    private void writeFileWithDialog(String name, byte[] fid) {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("选择 " + name + " 文件");
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Binary files", "bin"));
+        
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            File file = chooser.getSelectedFile();
+            writeFileAsync(name, fid, file.toPath());
+        }
+    }
+    
+    /**
+     * 异步写入文件（支持大文件分段）
+     */
+    private void writeFileAsync(String name, byte[] fid, Path filePath) {
+        SwingWorker<Boolean, Integer> worker = new SwingWorker<Boolean, Integer>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                log("\n=== 写入 " + name + " ===");
+                log("文件: " + filePath.getFileName());
+                
+                // 读取文件
+                byte[] data = Files.readAllBytes(filePath);
+                log("大小: " + data.length + " 字节");
+                
+                // 选择文件
+                CommandAPDU selectFile = new CommandAPDU(0x00, 0xA4, 0x02, 0x0C, fid);
+                ResponseAPDU response = transmit(selectFile);
+                
+                if (response.getSW() != 0x9000) {
+                    log("✗ 选择文件失败: " + String.format("%04X", response.getSW()));
+                    return false;
+                }
+                
+                // 根据文件大小选择块大小
+                boolean isLargeFile = data.length > 5000;
+                int chunkSize = isLargeFile ? LARGE_CHUNK_SIZE : SMALL_CHUNK_SIZE;
+                log("使用块大小: " + chunkSize + " 字节");
+                
+                // 分段写入
+                int offset = 0;
+                int totalChunks = (data.length + chunkSize - 1) / chunkSize;
+                int currentChunk = 0;
+                
+                while (offset < data.length) {
+                    int remaining = data.length - offset;
+                    int size = Math.min(chunkSize, remaining);
+                    
+                    byte[] chunk = Arrays.copyOfRange(data, offset, offset + size);
+                    
+                    CommandAPDU updateCmd = new CommandAPDU(
+                        0x00, 0xD6,
+                        (offset >> 8) & 0xFF,
+                        offset & 0xFF,
+                        chunk
+                    );
+                    
+                    response = transmit(updateCmd);
+                    
+                    if (response.getSW() != 0x9000) {
+                        log("✗ 写入失败于偏移 " + offset + ": " + String.format("%04X", response.getSW()));
+                        return false;
+                    }
+                    
+                    offset += size;
+                    currentChunk++;
+                    
+                    // 更新进度
+                    int progress = (currentChunk * 100) / totalChunks;
+                    publish(progress);
+                    
+                    // 大文件写入延迟，保护芯片
+                    if (isLargeFile && currentChunk < totalChunks) {
+                        Thread.sleep(CHUNK_DELAY_MS);
+                    }
+                }
+                
+                log("✓ " + name + " 写入成功");
+                return true;
+            }
+            
+            @Override
+            protected void process(List<Integer> chunks) {
+                for (Integer progress : chunks) {
+                    progressBar.setValue(progress);
+                    lblProgress.setText("写入进度: " + progress + "%");
+                }
+            }
+            
+            @Override
+            protected void done() {
+                progressBar.setValue(0);
+                lblProgress.setText(" ");
+                try {
+                    if (get()) {
+                        JOptionPane.showMessageDialog(EPassportWriter.this,
+                            name + " 写入成功", "成功", JOptionPane.INFORMATION_MESSAGE);
+                    }
+                } catch (Exception e) {
+                    logError("写入失败", e);
+                }
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * 读取文件
+     */
+    private void readFile(String name, byte[] fid) {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        SwingWorker<byte[], Void> worker = new SwingWorker<byte[], Void>() {
+            @Override
+            protected byte[] doInBackground() throws Exception {
+                log("\n=== 读取 " + name + " ===");
+                
+                // 选择文件
+                CommandAPDU selectFile = new CommandAPDU(0x00, 0xA4, 0x02, 0x0C, fid);
+                ResponseAPDU response = transmit(selectFile);
+                
+                if (response.getSW() != 0x9000) {
+                    log("✗ 选择文件失败: " + String.format("%04X", response.getSW()));
+                    return null;
+                }
+				                // 读取前256字节以确定实际大小
+                CommandAPDU readCmd = new CommandAPDU(0x00, 0xB0, 0x00, 0x00, 256);
+                response = transmit(readCmd);
+                
+                if (response.getSW() == 0x9000) {
+                    byte[] firstBlock = response.getData();
+                    log("✓ 读取成功，前16字节: " + bytesToHex(Arrays.copyOf(firstBlock, 16)));
+                    
+                    // 保存到文件
+                    JFileChooser chooser = new JFileChooser();
+                    chooser.setDialogTitle("保存 " + name);
+                    chooser.setSelectedFile(new File(name + ".bin"));
+                    
+                    if (chooser.showSaveDialog(EPassportWriter.this) == JFileChooser.APPROVE_OPTION) {
+                        Files.write(chooser.getSelectedFile().toPath(), firstBlock);
+                        log("✓ 已保存到: " + chooser.getSelectedFile().getName());
+                    }
+                    
+                    return firstBlock;
+                } else {
+                    log("✗ 读取失败: " + String.format("%04X", response.getSW()));
+                    return null;
+                }
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * 设置 BAC 密钥
+     */
+	private void setBACKeys() {
+		if (!isConnected) {
+			JOptionPane.showMessageDialog(this, "请先连接卡片");
+			return;
+		}
+		
+		String[] mrzLines = txtMRZ.getText().split("\n");
+		if (mrzLines.length < 2) {
+			JOptionPane.showMessageDialog(this, "请输入完整的 MRZ（两行）");
+			return;
+		}
+		
+		SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+			@Override
+			protected Boolean doInBackground() throws Exception {
+				log("\n=== 设置 BAC 密钥 ===");
+				
+				// 解析 MRZ
+				MRZInfo mrzInfo = parseMRZ(mrzLines[0], mrzLines[1]);
+				log("文档号: " + mrzInfo.documentNumber);
+				log("生日: " + mrzInfo.dateOfBirth);
+				log("有效期: " + mrzInfo.dateOfExpiry);
+				
+				// 构建 BER-TLV 数据
+				byte[] berTlvData = buildBACData(mrzInfo);
+				
+				// 发送 PUT DATA 命令 (P1=00, P2=62)
+				CommandAPDU setBACCmd = new CommandAPDU(
+					0x00, 0xDA, 0x00, 0x62,  // 正确的参数
+					berTlvData
+				);
+				
+				ResponseAPDU response = transmit(setBACCmd);
+				
+				if (response.getSW() == 0x9000) {
+					log("✓ BAC 密钥设置成功");
+					return true;
+				} else {
+					log("✗ BAC 密钥设置失败: " + String.format("%04X", response.getSW()));
+					return false;
+				}
+			}
+		};
+		
+		worker.execute();
+	}
+    
+    /**
+     * 快速个人化
+     */
+    private void quickPersonalize() {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        // 选择文件夹
+        JFileChooser chooser = new JFileChooser();
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setDialogTitle("选择包含 DG1.bin, DG2.bin, SOD.bin 的文件夹");
+        
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
+        
+        File folder = chooser.getSelectedFile();
+        File dg1File = new File(folder, "DG1.bin");
+        File dg2File = new File(folder, "DG2.bin");
+        File sodFile = new File(folder, "SOD.bin");
+        
+        // 检查文件是否存在
+        if (!dg1File.exists() || !dg2File.exists() || !sodFile.exists()) {
+            JOptionPane.showMessageDialog(this, 
+                "文件夹中必须包含 DG1.bin, DG2.bin 和 SOD.bin",
+                "错误", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        
+        // 确认操作
+        int result = JOptionPane.showConfirmDialog(this,
+            "即将开始个人化：\n" +
+            "1. 写入 EF.COM\n" +
+            "2. 写入 DG1 (" + formatFileSize(dg1File.length()) + ")\n" +
+            "3. 写入 DG2 (" + formatFileSize(dg2File.length()) + ")\n" +
+            "4. 写入 SOD (" + formatFileSize(sodFile.length()) + ")\n" +
+            "5. 设置 BAC 密钥\n\n" +
+            "是否继续？",
+            "确认个人化", JOptionPane.YES_NO_OPTION);
+        
+        if (result != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        // 禁用按钮
+        btnQuickPersonalize.setEnabled(false);
+        progressBar.setValue(0);
+        
+        SwingWorker<Boolean, String> worker = new SwingWorker<Boolean, String>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                try {
+                    publish("开始个人化流程...");
+                    
+                    // 步骤1: 写入 EF.COM (10%)
+                    publish("写入 EF.COM...");
+                    if (!writeEFCOM()) return false;
+                    progressBar.setValue(10);
+                    
+                    // 步骤2: 写入 DG1 (30%)
+                    publish("写入 DG1...");
+                    if (!writeFileSync("DG1", FID_EF_DG1, dg1File.toPath())) return false;
+                    progressBar.setValue(30);
+                    
+                    // 步骤3: 写入 DG2 (60%)
+                    publish("写入 DG2（大文件，请耐心等待）...");
+                    if (!writeFileSync("DG2", FID_EF_DG2, dg2File.toPath())) return false;
+                    progressBar.setValue(60);
+                    
+                    // 步骤4: 写入 SOD (80%)
+                    publish("写入 SOD...");
+                    if (!writeFileSync("SOD", FID_EF_SOD, sodFile.toPath())) return false;
+                    progressBar.setValue(80);
+                    
+                    // 步骤5: 设置 BAC (100%)
+                    publish("设置 BAC 密钥...");
+                    if (!setBACKeysSync()) return false;
+                    progressBar.setValue(100);
+                    
+                    publish("✓ 个人化完成！");
+                    return true;
+                    
+                } catch (Exception e) {
+                    logError("个人化失败", e);
+                    return false;
+                }
+            }
+            
+            @Override
+            protected void process(List<String> chunks) {
+                for (String msg : chunks) {
+                    lblProgress.setText(msg);
+                }
+            }
+            
+            @Override
+            protected void done() {
+                btnQuickPersonalize.setEnabled(true);
+                try {
+                    if (get()) {
+                        JOptionPane.showMessageDialog(EPassportWriter.this,
+                            "个人化成功完成！\n\n" +
+                            "下一步：\n" +
+                            "1. 可以测试 BAC 认证\n" +
+                            "2. 确认无误后锁定卡片",
+                            "成功", JOptionPane.INFORMATION_MESSAGE);
+                    } else {
+                        JOptionPane.showMessageDialog(EPassportWriter.this,
+                            "个人化失败，请查看日志",
+                            "错误", JOptionPane.ERROR_MESSAGE);
+                    }
+                } catch (Exception e) {
+                    logError("个人化错误", e);
+                }
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * 写入 EF.COM
+     */
+    private boolean writeEFCOM() throws Exception {
+        // 构建标准 EF.COM 内容
+        ByteArrayOutputStream efcom = new ByteArrayOutputStream();
+        
+        // Tag 60 - Common data elements
+        efcom.write(0x60);
+        efcom.write(0x16);  // Length
+        
+        // Tag 5F36 - Unicode version
+        efcom.write(0x5F);
+        efcom.write(0x36);
+        efcom.write(0x06);
+        efcom.write("040000".getBytes(), 0, 6);  // Version 4.0.0
+        
+        // Tag 5C - Tag list (present data groups)
+        efcom.write(0x5C);
+        efcom.write(0x04);  // Length
+        efcom.write(0x5F);  // DG1
+        efcom.write(0x61);
+        efcom.write(0x5F);  // DG2
+        efcom.write(0x75);
+        
+        byte[] data = efcom.toByteArray();
+        
+        // 选择并写入
+        CommandAPDU selectFile = new CommandAPDU(0x00, 0xA4, 0x02, 0x0C, FID_EF_COM);
+        ResponseAPDU response = transmit(selectFile);
+        
+        if (response.getSW() != 0x9000) {
+            return false;
+        }
+        
+        CommandAPDU updateCmd = new CommandAPDU(0x00, 0xD6, 0x00, 0x00, data);
+        response = transmit(updateCmd);
+        
+        return response.getSW() == 0x9000;
+    }
+    
+    /**
+     * 同步写入文件（用于快速个人化）
+     */
+    private boolean writeFileSync(String name, byte[] fid, Path filePath) throws Exception {
+        byte[] data = Files.readAllBytes(filePath);
+        log("写入 " + name + ": " + data.length + " 字节");
+        
+        // 选择文件
+        CommandAPDU selectFile = new CommandAPDU(0x00, 0xA4, 0x02, 0x0C, fid);
+        ResponseAPDU response = transmit(selectFile);
+        
+        if (response.getSW() != 0x9000) {
+            return false;
+        }
+        
+        // 根据文件大小选择策略
+        boolean isLargeFile = data.length > 5000;
+        int chunkSize = isLargeFile ? LARGE_CHUNK_SIZE : SMALL_CHUNK_SIZE;
+        
+        // 分段写入
+        int offset = 0;
+        while (offset < data.length) {
+            int size = Math.min(chunkSize, data.length - offset);
+            byte[] chunk = Arrays.copyOfRange(data, offset, offset + size);
+            
+            CommandAPDU updateCmd = new CommandAPDU(
+                0x00, 0xD6,
+                (offset >> 8) & 0xFF,
+                offset & 0xFF,
+                chunk
+            );
+            
+            response = transmit(updateCmd);
+            if (response.getSW() != 0x9000) {
+                return false;
+            }
+            
+            offset += size;
+            
+            // 大文件写入延迟
+            if (isLargeFile && offset < data.length) {
+                Thread.sleep(CHUNK_DELAY_MS);
+            }
+        }
+        
+        return true;
+    }
+    
+    /**
+     * 同步设置 BAC 密钥
+     */
+	private boolean setBACKeysSync() throws Exception {
+		String[] mrzLines = txtMRZ.getText().split("\n");
+		MRZInfo mrzInfo = parseMRZ(mrzLines[0], mrzLines[1]);
+		
+		// 构建 BER-TLV 数据
+		byte[] berTlvData = buildBACData(mrzInfo);
+		
+		CommandAPDU setBACCmd = new CommandAPDU(
+			0x00, 0xDA, 0x00, 0x62,  // 正确的参数
+			berTlvData
+		);
+		
+		ResponseAPDU response = transmit(setBACCmd);
+		return response.getSW() == 0x9000;
+	}
+    
+/**
+ * 构建 BAC 数据 - 符合 PassportApplet 期望的格式
+ */
+	private byte[] buildBACData(String documentNumber, String checkDigit, 
+							   String dateOfBirth, String dateOfExpiry) {
+		try {
+			ByteArrayOutputStream baos = new ByteArrayOutputStream();
+			
+			// 构建三个简单的 TLV
+			// Tag 81: 护照号+校验位
+			String docNumWithCheck = documentNumber + checkDigit;
+			byte[] docNumBytes = docNumWithCheck.getBytes("ASCII");
+			baos.write(0x81); // Tag
+			baos.write(docNumBytes.length); // Length
+			baos.write(docNumBytes); // Value
+			
+			// Tag 82: 出生日期 (YYMMDD)
+			byte[] dobBytes = dateOfBirth.getBytes("ASCII");
+			baos.write(0x82); // Tag
+			baos.write(dobBytes.length); // Length
+			baos.write(dobBytes); // Value
+			
+			// Tag 83: 有效期 (YYMMDD)
+			byte[] expBytes = dateOfExpiry.getBytes("ASCII");
+			baos.write(0x83); // Tag
+			baos.write(expBytes.length); // Length
+			baos.write(expBytes); // Value
+			
+			// 获取内部数据
+			byte[] innerData = baos.toByteArray();
+			
+			// 构建外层容器 (Tag 62)
+			ByteArrayOutputStream result = new ByteArrayOutputStream();
+			result.write(0x62); // Tag
+			
+			// 写入长度（如果长度>127，需要使用长格式）
+			if (innerData.length <= 127) {
+				result.write(innerData.length);
+			} else {
+				result.write(0x81); // 长度的长度=1
+				result.write(innerData.length);
+			}
+			
+			// 写入数据
+			result.write(innerData);
+			
+			return result.toByteArray();
+			
+		} catch (Exception e) {
+			logArea.append("构建BAC数据失败: " + e.getMessage() + "\n");
+			return null;
+		}
+	}
+
+
+	/**
+	 * 写入 TLV 格式数据
+	 */
+	private void writeTLV(ByteArrayOutputStream baos, int tag, byte[] value) throws IOException {
+		// 写入标签
+		if (tag > 0xFF) {
+			baos.write((tag >> 8) & 0xFF);
+			baos.write(tag & 0xFF);
+		} else {
+			baos.write(tag);
+		}
+		
+		// 写入长度
+		if (value.length <= 127) {
+			baos.write(value.length);
+		} else if (value.length <= 255) {
+			baos.write(0x81);
+			baos.write(value.length);
+		} else {
+			baos.write(0x82);
+			baos.write((value.length >> 8) & 0xFF);
+			baos.write(value.length & 0xFF);
+		}
+		
+		// 写入值
+		baos.write(value);
+	}
+	
+	
+    /**
+     * 锁定卡片
+     */
+    private void lockCard() {
+        if (!isConnected) {
+            JOptionPane.showMessageDialog(this, "请先连接卡片");
+            return;
+        }
+        
+        int result = JOptionPane.showConfirmDialog(this,
+            "警告：锁定操作不可逆！\n\n" +
+            "锁定后：\n" +
+            "• 所有数据将变为只读\n" +
+            "• 无法再修改任何内容\n" +
+            "• 无法解锁\n\n" +
+            "确定要锁定卡片吗？",
+            "锁定确认", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        
+        if (result != JOptionPane.YES_OPTION) {
+            return;
+        }
+        
+        // 二次确认
+        String confirm = JOptionPane.showInputDialog(this, 
+            "请输入 LOCK 确认锁定操作：");
+        
+        if (!"LOCK".equals(confirm)) {
+            return;
+        }
+        
+        SwingWorker<Boolean, Void> worker = new SwingWorker<Boolean, Void>() {
+            @Override
+            protected Boolean doInBackground() throws Exception {
+                log("\n=== 锁定卡片 ===");
+                
+                CommandAPDU lockCmd = new CommandAPDU(
+                    0x00, 0xDA, 0xDE, 0xAD, new byte[0]
+                );
+                
+                ResponseAPDU response = transmit(lockCmd);
+                
+                if (response.getSW() == 0x9000) {
+                    log("✓ 卡片已永久锁定");
+                    isLocked = true;
+                    return true;
+                } else {
+                    log("✗ 锁定失败: " + String.format("%04X", response.getSW()));
+                    return false;
+                }
+            }
+            
+            @Override
+            protected void done() {
+                try {
+                    if (get()) {
+                        JOptionPane.showMessageDialog(EPassportWriter.this,
+                            "卡片已成功锁定！", "完成", JOptionPane.INFORMATION_MESSAGE);
+                        updateUIState();
+                    }
+                } catch (Exception e) {
+                    logError("锁定失败", e);
+                }
+            }
+        };
+        
+        worker.execute();
+    }
+    
+    /**
+     * 测试 BAC
+     */
+    private void testBAC() {
+        log("\n=== BAC 测试 ===");
+        log("功能尚未实现");
+        // TODO: 实现 BAC 认证测试
+    }
+    
+    /**
+     * APDU 传输
+     */
+    private ResponseAPDU transmit(CommandAPDU cmd) throws CardException {
+        if (chkVerboseLog.isSelected()) {
+            log("→ " + bytesToHex(cmd.getBytes()));
+        }
+        ResponseAPDU response = channel.transmit(cmd);
+        if (chkVerboseLog.isSelected()) {
+            log("← " + bytesToHex(response.getBytes()));
+        }
+        return response;
+    }
+    
+    /**
+     * 更新 UI 状态
+     */
+    private void updateUIState() {
+        boolean connected = isConnected && !isLocked;
+        
+        // 连接按钮
+        btnConnect.setEnabled(!isConnected);
+        btnDisconnect.setEnabled(isConnected);
+        
+        // 文件操作按钮
+        btnClearDG1.setEnabled(connected);
+        btnClearDG2.setEnabled(connected);
+        btnClearSOD.setEnabled(connected);
+        btnClearAll.setEnabled(connected);
+        btnWriteDG1.setEnabled(connected);
+        btnWriteDG2.setEnabled(connected);
+        btnWriteSOD.setEnabled(connected);
+        btnReadDG1.setEnabled(isConnected);
+        btnReadDG2.setEnabled(isConnected);
+        btnReadSOD.setEnabled(isConnected);
+        
+        // 个人化按钮
+        btnSetBAC.setEnabled(connected);
+        btnQuickPersonalize.setEnabled(connected);
+        btnLockCard.setEnabled(connected);
+        btnTestBAC.setEnabled(isConnected);
+        
+        if (isLocked) {
+            lblStatus.setText("已锁定");
+            lblStatus.setForeground(Color.ORANGE);
+        }
+    }
+    
+    /**
+     * 日志输出
+     */
+    private void log(String message) {
+        SwingUtilities.invokeLater(() -> {
+            logArea.append(message + "\n");
+            if (chkAutoScroll.isSelected()) {
+                logArea.setCaretPosition(logArea.getDocument().getLength());
+            }
+        });
+    }
+    
+    private void logError(String message, Exception e) {
+        log("✗ " + message + ": " + e.getMessage());
+        if (chkVerboseLog.isSelected()) {
+            e.printStackTrace();
+        }
+    }
+    
+    /**
+     * 工具方法：字节转十六进制
+     */
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder();
+        for (byte b : bytes) {
+            result.append(String.format("%02X ", b));
+        }
+        return result.toString().trim();
+    }
+    
+    /**
+     * 格式化文件大小
+     */
+    private String formatFileSize(long size) {
+        if (size < 1024) return size + " B";
+        if (size < 1024 * 1024) return String.format("%.1f KB", size / 1024.0);
+        return String.format("%.1f MB", size / (1024.0 * 1024));
+    }
+    
+    /**
+     * MRZ 信息类
+     */
+	private static class MRZInfo {
+		String documentNumber;
+		String documentCheckDigit;
+		String dateOfBirth;
+		String dateOfExpiry;
+		
+		@Override
+		public String toString() {
+			return String.format("MRZ[doc=%s(%s), dob=%s, exp=%s]", 
+				documentNumber, documentCheckDigit, dateOfBirth, dateOfExpiry);
+		}
+	}
+    
+    /**
+     * 解析 MRZ
+     */
+	private MRZInfo parseMRZ(String line1, String line2) {
+		MRZInfo info = new MRZInfo();
+		
+		// TD3 格式 (护照)
+		if (line1.length() >= 44 && line2.length() >= 44) {
+			// 文档号（位置 0-8）+ 校验位（位置 9）
+			String rawDocNum = line2.substring(0, 9);
+			info.documentNumber = rawDocNum.replace('<', ' ').trim();
+			info.documentCheckDigit = String.valueOf(line2.charAt(9));
+			
+			// 生日 YYMMDD（位置 13-18）
+			info.dateOfBirth = line2.substring(13, 19);
+			
+			// 有效期 YYMMDD（位置 21-26）
+			info.dateOfExpiry = line2.substring(21, 27);
+		}
+		
+		return info;
+	}
+    
+
+	public static void main(String[] args) {
+		// 设置系统外观
+		try {
+			UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+		} catch (Exception e) {
+			// 忽略
+		}
+		
+		SwingUtilities.invokeLater(() -> {
+			EPassportWriter app = new EPassportWriter();
+			app.setVisible(true);
+		});
+	}
+
+} 
